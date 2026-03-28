@@ -82,7 +82,7 @@ def setup_logging(verbose: bool = False) -> None:
 # ──────────────────────────────────────────────
 def get_llm(temperature: float = 0.2) -> ChatOpenAI:
     """Инициализация LLM. Поддерживает любую OpenAI-совместимую модель."""
-    model_name = os.getenv("MODEL_NAME", "gpt-4o")
+    model_name = os.getenv("MODEL_NAME", "gpt-5.4-mini-2026-03-17")
     logger.debug("Инициализация LLM: model=%s, temperature=%.2f", model_name, temperature)
     return ChatOpenAI(
         model=model_name,
@@ -152,6 +152,12 @@ CODE_PROMPT = ChatPromptTemplate.from_messages([
                - await dp.start_polling(bot)
                - ВАЖНО: Bot(token=..., default=DefaultBotProperties(parse_mode=ParseMode.HTML))
                - НЕЛЬЗЯ использовать Bot(parse_mode=...) — это удалено в 3.7.0!
+               - Все типы aiogram — pydantic-модели, ТОЛЬКО keyword аргументы:
+                 KeyboardButton(text="/meme")  — ПРАВИЛЬНО
+                 KeyboardButton("/meme")       — НЕПРАВИЛЬНО!
+                 InlineKeyboardButton(text="Мем", callback_data="meme")  — ПРАВИЛЬНО
+               - ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="...")]]) — ПРАВИЛЬНО
+               - НЕ используй .add() или .row() — их НЕТ в aiogram 3.x!
             2. Все хэндлеры — async def.
             3. Используй python-dotenv для загрузки переменных:
                from dotenv import load_dotenv
@@ -161,8 +167,13 @@ CODE_PROMPT = ChatPromptTemplate.from_messages([
             5. Добавь необходимые импорты (os, asyncio, logging и т.д.).
             6. В конце файла — блок if __name__ == "__main__" с asyncio.run(main()).
             7. Добавляй краткие комментарии к ключевым блокам.
-            8. Если нужны внешние API или данные — используй бесплатные публичные API
-               или генерируй данные встроенными средствами Python.
+            8. НЕ используй локальные файлы и папки (например, папку "memes/"),
+               ЕСЛИ пользователь явно не указал это в описании бота.
+               Если нужны данные (мемы, картинки, цитаты и т.д.) — используй:
+               - Встроенный список URL/данных прямо в коде (list/dict)
+               - Бесплатные публичные HTTP API (например: meme-api.com, random.dog и т.д.)
+               - Генерация данных средствами Python (random, string и т.д.)
+               Код должен работать сразу после запуска без дополнительной настройки.
 
             Верни ТОЛЬКО Python-код, без маркдауна, без обёрток в ```.
         """),
@@ -185,7 +196,7 @@ REVIEW_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         textwrap.dedent("""\
-            Ты — code reviewer для Python и aiogram 3.x.
+            Ты — code reviewer для Python и aiogram 3.x (версия 3.7+).
             Тебе дан код Telegram-бота. Проверь его:
 
             1. Синтаксические ошибки — код должен парситься ast.parse().
@@ -196,10 +207,19 @@ REVIEW_PROMPT = ChatPromptTemplate.from_messages([
             5. BOT_TOKEN читается из os.getenv("BOT_TOKEN").
             6. Нет заглушек, TODO, pass-only функций.
 
-            Если код корректен — верни его БЕЗ ИЗМЕНЕНИЙ.
-            Если есть ошибки — ИСПРАВЬ их и верни исправленный код.
+            ВАЖНЫЕ ПРАВИЛА:
+            - НЕ МЕНЯЙ импорты, если они корректны.
+            - В aiogram 3.7+ правильный способ указания parse_mode:
+              from aiogram.client.default import DefaultBotProperties
+              Bot(token=..., default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+              Это ПРАВИЛЬНЫЙ код — НЕ МЕНЯЙ его!
+            - Будь КОНСЕРВАТИВЕН: если не уверен что что-то сломано — НЕ ТРОГАЙ.
+            - Исправляй только ЯВНЫЕ ошибки.
 
-            В любом случае верни ТОЛЬКО Python-код, без маркдауна, без обёрток в ```.
+            Если код корректен — верни его БЕЗ ИЗМЕНЕНИЙ.
+            Если есть ошибки — ИСПРАВЬ только их и верни исправленный код.
+
+            Верни ТОЛЬКО Python-код, без пояснений, без маркдауна, без обёрток в ```.
         """),
     ),
     ("human", "{code}"),
@@ -211,29 +231,116 @@ def build_review_chain():
 
 
 # ──────────────────────────────────────────────
+# 4. FIX CHAIN (исправление конкретных ошибок)
+# ──────────────────────────────────────────────
+FIX_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        textwrap.dedent("""\
+            Ты — Python-разработчик. Тебе дан код Telegram-бота с конкретной ошибкой.
+            
+            ПРАВИЛА:
+            - Исправь ТОЛЬКО указанную ошибку.
+            - НЕ меняй и НЕ удаляй остальной код.
+            - НЕ меняй рабочие импорты. В частности, import
+              from aiogram.client.default import DefaultBotProperties — ПРАВИЛЬНЫЙ.
+            - Верни ТОЛЬКО исправленный Python-код, без пояснений, без маркдауна, без обёрток в ```.
+        """),
+    ),
+    ("human", "Ошибка: {error}\n\nКод:\n{code}"),
+])
+
+
+def build_fix_chain():
+    return FIX_PROMPT | get_llm(temperature=0.0) | StrOutputParser()
+
+
+# ──────────────────────────────────────────────
 # Утилиты
 # ──────────────────────────────────────────────
-def strip_markdown_fences(text: str) -> str:
-    """Убирает ```python ... ``` обёртки, если LLM их добавила."""
+def extract_code(text: str) -> str:
+    """
+    Извлекает Python-код из ответа LLM.
+    Обрабатывает случаи:
+      - Чистый код без обёрток
+      - Код в ```python ... ```
+      - Пояснительный текст + код в ``` блоке
+    """
+    import re
+
     text = text.strip()
-    if text.startswith("```"):
-        # Убираем первую строку (```python или ```)
-        lines = text.split("\n")
-        lines = lines[1:]  # убираем открывающий fence
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]  # убираем закрывающий fence
-        text = "\n".join(lines)
-    return text.strip()
+
+    # Ищем все блоки ```python ... ``` или ``` ... ```
+    pattern = r"```(?:python)?\s*\n(.*?)```"
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    if matches:
+        # Берём самый длинный блок кода
+        code = max(matches, key=len).strip()
+        logger.debug("Извлечён код из markdown-блока (%d символов)", len(code))
+        return code
+
+    # Если нет markdown-блоков — ищем начало кода по маркерам
+    # Берём САМЫЙ РАННИЙ маркер, чтобы не обрезать import перед from
+    markers = ("import ", "from ", "# -*-", "#!/")
+    first_pos = len(text)
+    first_marker = None
+    for marker in markers:
+        idx = text.find(marker)
+        if idx >= 0 and idx < first_pos:
+            first_pos = idx
+            first_marker = marker
+
+    if first_marker and first_pos > 0:
+        code = text[first_pos:].strip()
+        logger.debug("Извлечён код по маркеру '%s' (отброшено %d символов пояснений)",
+                    first_marker, first_pos)
+        return code
+
+    # Ничего не нашли или код начинается с маркера — возвращаем как есть
+    return text
 
 
-def validate_syntax(code: str) -> bool:
-    """Проверка синтаксиса через ast.parse."""
+def validate_code(code: str) -> tuple[bool, str]:
+    """
+    Комплексная проверка кода.
+    Возвращает (is_valid, error_description).
+    """
+    # 1. Синтаксис
     try:
-        ast.parse(code)
-        return True
+        tree = ast.parse(code)
     except SyntaxError as e:
-        logger.warning("⚠️  Синтаксическая ошибка: %s (строка %s)", e.msg, e.lineno)
-        return False
+        error = f"Синтаксическая ошибка: {e.msg} (строка {e.lineno})"
+        logger.warning("⚠️  %s", error)
+        return False, error
+
+    # 2. Собираем все импортированные имена
+    imported_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name)
+
+    # Проверяем стандартные модули, которые часто забывают импортировать
+    STDLIB_NAMES = {"os", "asyncio", "logging", "random", "json", "sys", "re"}
+    used_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in STDLIB_NAMES:
+            used_names.add(node.id)
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in STDLIB_NAMES:
+                used_names.add(node.value.id)
+
+    missing = used_names - imported_names
+    if missing:
+        error = f"Отсутствуют импорты: {', '.join(sorted(missing))}"
+        logger.warning("⚠️  %s", error)
+        return False, error
+
+    return True, ""
 
 
 # ──────────────────────────────────────────────
@@ -270,36 +377,71 @@ def run_pipeline(task_description: str) -> str:
         "task_description": task_description,
         "analysis": analysis,
     })
-    raw_code = strip_markdown_fences(raw_code)
+    raw_code = extract_code(raw_code)
     elapsed = time.perf_counter() - t0
     lines_count = len(raw_code.splitlines())
     logger.info("   Код сгенерирован за %.1f сек (%d строк, %d символов)",
                 elapsed, lines_count, len(raw_code))
     logger.debug("Сгенерированный код:\n%s", raw_code[:500] + "..." if len(raw_code) > 500 else raw_code)
 
-    # ── Звено 3: Ревью кода ──
-    logger.info("🔎 [3/3] Проверка и ревью кода...")
-    t0 = time.perf_counter()
+    # ── Звено 3: Ревью + повторные попытки при ошибках ──
+    MAX_RETRIES = 3
     review_chain = build_review_chain()
-    reviewed_code = review_chain.invoke({"code": raw_code})
-    reviewed_code = strip_markdown_fences(reviewed_code)
-    elapsed = time.perf_counter() - t0
+    current_code = raw_code
+    is_valid, error_msg = validate_code(raw_code)
+    pre_review_valid = is_valid
 
-    # Сравнение: были ли изменения после ревью
-    if reviewed_code.strip() == raw_code.strip():
-        logger.info("   Ревью завершено за %.1f сек — код не изменён ✓", elapsed)
-    else:
-        diff_lines = abs(len(reviewed_code.splitlines()) - lines_count)
-        logger.info("   Ревью завершено за %.1f сек — код ИЗМЕНЁН (±%d строк)",
-                    elapsed, diff_lines)
-        logger.debug("Код после ревью:\n%s",
-                     reviewed_code[:500] + "..." if len(reviewed_code) > 500 else reviewed_code)
+    if pre_review_valid:
+        logger.debug("Код до ревью корректен")
 
-    # ── Финальная проверка синтаксиса ──
-    if validate_syntax(reviewed_code):
-        logger.info("✅ Синтаксис корректен.")
-    else:
-        logger.warning("⚠️  Внимание: в коде могут быть синтаксические ошибки.")
+    fix_chain = build_fix_chain()
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        if attempt == 1:
+            # Первый проход — стандартное ревью
+            logger.info("🔎 [3/3] Проверка и ревью кода...")
+            t0 = time.perf_counter()
+            reviewed_code = review_chain.invoke({"code": current_code})
+        else:
+            # Повторные проходы — целенаправленное исправление ошибки
+            logger.info("🔧 [3/3] Исправление ошибки (попытка %d/%d): %s",
+                       attempt, MAX_RETRIES, error_msg)
+            t0 = time.perf_counter()
+            reviewed_code = fix_chain.invoke({"code": current_code, "error": error_msg})
+
+        reviewed_code = extract_code(reviewed_code)
+        elapsed = time.perf_counter() - t0
+
+        # Сравнение: были ли изменения
+        if reviewed_code.strip() == current_code.strip():
+            logger.info("   Завершено за %.1f сек — код не изменён ✓", elapsed)
+        else:
+            diff_lines = abs(len(reviewed_code.splitlines()) - lines_count)
+            logger.info("   Завершено за %.1f сек — код ИЗМЕНЁН (±%d строк)",
+                        elapsed, diff_lines)
+            logger.debug("Код после обработки:\n%s",
+                         reviewed_code[:500] + "..." if len(reviewed_code) > 500 else reviewed_code)
+
+        # Проверка кода
+        is_valid, error_msg = validate_code(reviewed_code)
+        if is_valid:
+            logger.info("✅ Код корректен.")
+            current_code = reviewed_code
+            break
+        else:
+            # Если ревью сломало рабочий код — откат
+            if pre_review_valid and attempt == 1:
+                logger.warning("⚠️  Ревью СЛОМАЛО рабочий код — откат к оригиналу.")
+                current_code = raw_code
+                break
+            if attempt < MAX_RETRIES:
+                logger.warning("🔄 Ошибка: %s — отправляю на исправление...", error_msg)
+                current_code = reviewed_code
+            else:
+                logger.error("❌ Не удалось исправить за %d попыток.", MAX_RETRIES)
+                current_code = reviewed_code
+
+    reviewed_code = current_code
 
     total_elapsed = time.perf_counter() - pipeline_start
     logger.info("⏱  Общее время генерации: %.1f сек", total_elapsed)
