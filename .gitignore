@@ -1,0 +1,23 @@
+# Виртуальное окружение
+.venv/
+
+# Переменные окружения (секреты)
+.env
+
+# Сгенерированные файлы
+generated_bot.py
+generation.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
